@@ -1,8 +1,9 @@
 //! Mixer Brush: a reservoir of loaded paint plus a pickup well that mixes in canvas colour.
 //!
-//! Model (behavioural, our own): each dab samples the canvas colour under its footprint. The pickup
-//! colour `P` moves towards it by `wet`. The deposited colour mixes the reservoir `R` (weight
-//! `amount × (1 − mix·wet)`) with the pickup (weight `mix·wet`); it lands at `flow` times the total
+//! Model (behavioural, our own): the pickup well is tip-sized: each tip pixel `P` moves towards the
+//! canvas colour under it by `wet`, so a wet brush drags the canvas detail along rather than laying
+//! down the footprint's average. Each pixel's deposit mixes the reservoir `R` (weight
+//! `amount × (1 − mix·wet)`) with its pickup (weight `mix·wet`); it lands at `flow` times the total
 //! weight. The reservoir amount drains per dab unless `load` is 100 %, so low Load strokes dry out.
 //! A dry brush (`wet = 0`) paints only reservoir colour; an empty, wet brush smears canvas colour.
 
@@ -82,18 +83,28 @@ pub fn apply_mixer_stroke(
     };
     let res = state.reservoir.map(native);
     let mut amount = if res.is_some() { state.amount.clamp(0.0, 1.0) } else { 0.0 };
-    let mut pickup: Option<Vec<f32>> = state.pickup.map(native);
     let (wet, mix, flow, load) = (m.wet.clamp(0.0, 1.0), m.mix.clamp(0.0, 1.0), m.flow.clamp(0.0, 1.0), m.load.clamp(0.0, 1.0));
+    // Pickup well centred on the dab, one native pixel per tip pixel; `have` = it holds paint.
+    // Paint carried over from the last stroke fills it evenly.
+    let r = (stroke.brush.size.max(1.0) / 2.0).ceil() as i32 + 2;
+    // Cap to stroke bounds: cells beyond the canvas are never read, so no need to allocate them.
+    let ds = crate::dabs(stroke);
+    let ctx = crate::BrushContext::new(&stroke.brush);
+    let bounds = ds.iter().fold(Rect::EMPTY, |r, d| r.union(&ctx.dab_rect(d, false)));
+    let rad = r.min(bounds.width().max(bounds.height()) as i32);
+    let side = (2 * rad + 1) as usize;
+    let (mut well, mut have) = match state.pickup.map(native) {
+        Some(p) => (p.repeat(side * side), vec![true; side * side]),
+        None => (vec![0.0f32; side * side * n], vec![false; side * side]),
+    };
     let mut st = stroke.clone();
     st.brush.opacity = 1.0;
-    let mut acc = vec![0.0f32; n];
     let mut paint = vec![0.0f32; n];
     let dmg = apply_dab_stroke(target, &st, selection, lock_transparency, 0, |work, fp| {
         // Transfer › Wetness / Mix Jitter scale the settings per dab.
         let (wet, mix) = (wet * fp.dab.wet.clamp(0.0, 1.0), mix * fp.dab.mix.clamp(0.0, 1.0));
-        // Sample the canvas under the dab.
-        acc.iter_mut().for_each(|v| *v = 0.0);
-        let (mut wsum, mut asum) = (0.0f32, 0.0f32);
+        let wr = if res.is_some() { amount * (1.0 - mix * wet) } else { 0.0 };
+        let (cx, cy) = (fp.dab.center.x.floor() as i32, fp.dab.center.y.floor() as i32);
         let r = fp.rect.intersect(&work.rect);
         for y in r.y0..r.y1 {
             for x in r.x0..r.x1 {
@@ -101,52 +112,60 @@ pub fn apply_mixer_stroke(
                 if w <= 0.0 {
                     continue;
                 }
-                let px: Vec<f32> = match sample {
-                    Some(s) => {
-                        let v = s.pixel(x, y);
-                        if s.format() == fmt { v } else { from_rgba(&fmt, s.rgba(x, y)) }
-                    }
-                    None => work.px(x, y).to_vec(),
-                };
-                let al = a.map_or(1.0, |ai| px[ai]);
-                for c in 0..nc {
-                    acc[c] += px[c] * w * al;
-                }
-                wsum += w;
-                asum += w * al;
-            }
-        }
-        if asum > 1e-6 && wet > 0.0 {
-            let ca = asum / wsum.max(1e-6);
-            let canvas: Vec<f32> = (0..n).map(|c| if c < nc { acc[c] / asum } else { 1.0 }).collect();
-            pickup = Some(match pickup.take() {
-                None => canvas,
-                Some(p) => p.iter().zip(&canvas).map(|(p, c)| p + (c - p) * PICKUP_RATE * wet * ca).collect(),
-            });
-        }
-        let wr = if res.is_some() { amount * (1.0 - mix * wet) } else { 0.0 };
-        let wp = if pickup.is_some() { mix * wet } else { 0.0 };
-        let total = wr + wp;
-        if total > 1e-6 {
-            for c in 0..n {
-                let rv = res.as_ref().map_or(0.0, |v| v[c]);
-                let pv = pickup.as_ref().map_or(0.0, |v| v[c]);
-                paint[c] = (rv * wr + pv * wp) / total;
-            }
-            let dep = total.min(1.0) * flow;
-            for y in r.y0..r.y1 {
-                for x in r.x0..r.x1 {
-                    let k = fp.at(x, y) * dep;
-                    if k > 0.0 {
-                        over_native(&fmt, work.px_mut(x, y), &paint, k, lock_transparency);
+                let (qx, qy) = (x - cx + rad, y - cy + rad);
+                let cell = (qx >= 0 && qy >= 0 && qx < side as i32 && qy < side as i32).then(|| qy as usize * side + qx as usize);
+                // Pick up the canvas under this tip pixel.
+                if let Some(i) = cell
+                    && wet > 0.0
+                {
+                    let px: Vec<f32> = match sample {
+                        Some(s) => {
+                            let v = s.pixel(x, y);
+                            if s.format() == fmt { v } else { from_rgba(&fmt, s.rgba(x, y)) }
+                        }
+                        None => work.px(x, y).to_vec(),
+                    };
+                    let al = a.map_or(1.0, |ai| px[ai]);
+                    let q = &mut well[i * n..(i + 1) * n];
+                    if al > 0.0 && !have[i] {
+                        q[..nc].copy_from_slice(&px[..nc]);
+                        if let Some(ai) = a {
+                            q[ai] = 1.0;
+                        }
+                        have[i] = true;
+                    } else if al > 0.0 {
+                        let t = PICKUP_RATE * wet * al * w;
+                        for c in 0..nc {
+                            q[c] += (px[c] - q[c]) * t;
+                        }
                     }
                 }
+                let wp = if cell.is_some_and(|i| have[i]) { mix * wet } else { 0.0 };
+                let total = wr + wp;
+                if total <= 1e-6 {
+                    continue;
+                }
+                let q = cell.filter(|_| wp > 0.0).map(|i| &well[i * n..(i + 1) * n]);
+                for c in 0..n {
+                    let rv = res.as_ref().map_or(0.0, |v| v[c]);
+                    let pv = q.map_or(0.0, |v| v[c]);
+                    paint[c] = (rv * wr + pv * wp) / total;
+                }
+                over_native(&fmt, work.px_mut(x, y), &paint, w * total.min(1.0) * flow, lock_transparency);
             }
         }
         amount *= 1.0 - 0.08 * (1.0 - load);
     });
     state.amount = amount;
-    state.pickup = pickup.map(|p| to_rgba(&fmt, &p));
+    // Carry the well's average colour to the next stroke.
+    let held = have.iter().filter(|h| **h).count();
+    state.pickup = (held > 0).then(|| {
+        let mut avg = vec![0.0f32; n];
+        for (cell, _) in well.chunks_exact(n).zip(&have).filter(|(_, h)| **h) {
+            avg.iter_mut().zip(cell).for_each(|(s, v)| *s += v / held as f32);
+        }
+        to_rgba(&fmt, &avg)
+    });
     dmg
 }
 
@@ -207,6 +226,46 @@ mod tests {
         assert!(p[2] > 0.2, "{p:?}");
         st.clean();
         assert!(st.pickup.is_none());
+    }
+
+    #[test]
+    fn wet_brush_smears_canvas_detail_instead_of_averaging_it() {
+        // #5282: horizontal 2 px black/white stripes, stroked along the stripes with a wet, all-canvas
+        // mix. The picked-up paint is the canvas under each tip pixel, so the stripes are dragged
+        // along, not flattened into the footprint's average grey.
+        let mut s = Surface::new(PixelFormat::RGBA8);
+        for y in (0..20).step_by(4) {
+            s.fill_rect(Rect::new(0, y, 200, y + 2), &[0.0, 0.0, 0.0, 1.0]);
+            s.fill_rect(Rect::new(0, y + 2, 200, y + 4), &[1.0, 1.0, 1.0, 1.0]);
+        }
+        let mut st = MixerState::default();
+        st.load([1.0, 0.0, 0.0, 1.0]);
+        let mut k = stroke(10.0);
+        k.brush.size = 12.0;
+        apply_mixer_stroke(&mut s, None, &k, &MixerSettings { wet: 1.0, load: 1.0, mix: 1.0, flow: 1.0, ..Default::default() }, &mut st, None, false);
+        let (dark, light) = (s.rgba(100, 8)[0], s.rgba(100, 10)[0]);
+        assert!(light - dark > 0.5, "stripes flattened: {dark} vs {light}");
+    }
+
+    #[test]
+    fn wet_brush_drags_colour_across_edges() {
+        // #5282: stroke from black into white with an empty, wet brush. The black is carried into the
+        // white area (proves dragging happens, not just that averaging is avoided).
+        let mut s = Surface::new(PixelFormat::RGBA8);
+        s.fill_rect(Rect::new(0, 0, 100, 20), &[0.0, 0.0, 0.0, 1.0]);
+        s.fill_rect(Rect::new(100, 0, 200, 20), &[1.0, 1.0, 1.0, 1.0]);
+        let mut st = MixerState::default();
+        apply_mixer_stroke(
+            &mut s,
+            None,
+            &stroke(10.0),
+            &MixerSettings { wet: 1.0, load: 1.0, mix: 1.0, flow: 1.0, ..Default::default() },
+            &mut st,
+            None,
+            false,
+        );
+        // Black dragged into the white side.
+        assert!(s.rgba(110, 10)[0] < 0.3, "no dragging: {}", s.rgba(110, 10)[0]);
     }
 
     #[test]
